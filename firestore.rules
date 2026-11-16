@@ -1,0 +1,183 @@
+rules_version = '2';
+
+// =====================================================================
+// Flotilla de revolvedoras: reglas de seguridad de Firestore.
+//
+// Principios:
+//   * El rol y el estado activo se leen de /users/{uid} en CADA petición.
+//     Nadie puede escribir /users desde el navegador (solo el script con Admin SDK).
+//   * Un registro diario tiene ID "<uid>_<YYYY-MM-DD>". Solo se permite crear el
+//     de HOY (calculado aquí con request.time, la hora del servidor) y nunca
+//     modificarlo ni borrarlo. Si ya existe, crear se convierte en "update" y se niega.
+//   * Combustible, configuración y bitácora: solo administrador.
+//   * Todo cambio de configuración debe escribirse junto con su entrada de
+//     bitácora en el mismo batch; las reglas verifican ambos lados.
+// =====================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Auxiliares ----------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function me() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Activo y ya cambió su contraseña temporal. Mientras mustChangePassword sea
+    // true, la cuenta no puede registrar viajes ni ver nada administrativo.
+    function isActiveUser() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && me().active == true
+        && me().get('mustChangePassword', false) != true;
+    }
+
+    function isAdmin() {
+      return isActiveUser() && me().role == 'admin';
+    }
+
+    function isOperator() {
+      return isActiveUser() && me().role == 'operator';
+    }
+
+    function pad2(n) {
+      return n < 10 ? '0' + string(n) : string(n);
+    }
+
+    // Fecha local de operación (YYYY-MM-DD) según la hora del SERVIDOR
+    // y el desfase configurado en /settings/time.
+    function today() {
+      let offset = get(/databases/$(database)/documents/settings/time).data.utcOffsetMinutes;
+      let t = request.time + duration.value(offset, 'm');
+      return string(t.year()) + '-' + pad2(t.month()) + '-' + pad2(t.day());
+    }
+
+    function isNonNegNumber(v) {
+      return (v is int || v is float) && v >= 0 && v <= 100000;
+    }
+
+    // El cambio debe venir firmado por el admin, con hora del servidor
+    // y con una entrada nueva de bitácora creada en el mismo batch.
+    function auditedAdminUpdate() {
+      let d = request.resource.data;
+      return isAdmin()
+        && d.updatedBy == request.auth.uid
+        && d.updatedAt == request.time
+        && d.auditId is string
+        && (!('auditId' in resource.data) || d.auditId != resource.data.auditId)
+        && existsAfter(/databases/$(database)/documents/auditLog/$(d.auditId));
+    }
+
+    // ¿El mapa "snapshot" coincide con "actual" salvo los campos de metadatos?
+    function auditMatches(snapshot, actual) {
+      let diff = actual.diff(snapshot);  // addedKeys = llaves en "actual" que no están en "snapshot"
+      return diff.changedKeys().size() == 0
+        && diff.removedKeys().size() == 0
+        && diff.addedKeys().hasOnly(['updatedBy', 'updatedAt', 'auditId']);
+    }
+
+    // ---------- Perfiles ----------
+    // Escritura: solo Admin SDK (script local), salvo una excepción: el propio
+    // usuario quita su marca de "cambiar contraseña" tras cambiarla.
+    // Lectura: el propio usuario o el admin.
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && resource.data.active == true
+        && resource.data.get('mustChangePassword', false) == true
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['mustChangePassword', 'passwordChangedAt'])
+        && request.resource.data.mustChangePassword == false
+        && request.resource.data.passwordChangedAt == request.time;
+
+      allow create, delete: if false;
+    }
+
+    // ---------- Registros diarios ----------
+    match /dailyTrips/{tripId} {
+      // get: también funciona si el documento aún no existe (para saber si ya registró hoy).
+      allow get: if signedIn()
+        && (tripId.split('_')[0] == request.auth.uid || isAdmin());
+      allow list: if signedIn()
+        && (resource.data.userId == request.auth.uid || isAdmin());
+
+      allow create: if isOperator()
+        && tripId == request.auth.uid + '_' + today()
+        && request.resource.data.keys().hasOnly(['userId', 'workDate', 'trips', 'createdAt'])
+        && request.resource.data.keys().hasAll(['userId', 'workDate', 'trips', 'createdAt'])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.workDate == today()
+        && request.resource.data.trips is int
+        && request.resource.data.trips >= 0
+        && request.resource.data.trips <= 100
+        && request.resource.data.createdAt == request.time;
+
+      allow update, delete: if false;
+    }
+
+    // ---------- Configuración ----------
+    match /settings/{docId} {
+      // "time" lo necesitan los operadores para calcular la fecha; no tiene datos de combustible.
+      allow read: if (docId == 'time' && isActiveUser()) || isAdmin();
+
+      allow update: if docId == 'time'
+        && auditedAdminUpdate()
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['utcOffsetMinutes', 'label', 'updatedBy', 'updatedAt', 'auditId'])
+        && request.resource.data.utcOffsetMinutes is int
+        && request.resource.data.utcOffsetMinutes >= -720
+        && request.resource.data.utcOffsetMinutes <= 840
+        && request.resource.data.label is string
+        && request.resource.data.label.size() <= 60;
+
+      allow update: if docId == 'fuel'
+        && auditedAdminUpdate()
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['defaultInitialLiters', 'defaultLitersPerTrip', 'updatedBy', 'updatedAt', 'auditId'])
+        && isNonNegNumber(request.resource.data.defaultInitialLiters)
+        && isNonNegNumber(request.resource.data.defaultLitersPerTrip);
+
+      allow create, delete: if false;  // los crea el script (init)
+    }
+
+    // ---------- Combustible por operador ----------
+    match /fuelSettings/{uid} {
+      allow read: if isAdmin();
+      allow update: if auditedAdminUpdate()
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['initialLiters', 'litersPerTrip', 'updatedBy', 'updatedAt', 'auditId'])
+        && isNonNegNumber(request.resource.data.initialLiters)
+        && isNonNegNumber(request.resource.data.litersPerTrip);
+      allow create, delete: if false;  // los crea el script al dar de alta al operador
+    }
+
+    // ---------- Bitácora ----------
+    // Solo se crea junto con el cambio que describe (mismo batch). Inmutable.
+    match /auditLog/{logId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly(['collection', 'docId', 'before', 'after', 'changedBy', 'changedAt'])
+        && request.resource.data.changedBy == request.auth.uid
+        && request.resource.data.changedAt == request.time
+        && request.resource.data.collection in ['settings', 'fuelSettings']
+        && request.resource.data.docId is string
+        && request.resource.data.before is map
+        && request.resource.data.after is map
+        // El documento destino debe apuntar a esta entrada después del batch...
+        && getAfter(/databases/$(database)/documents/$(request.resource.data.collection)/$(request.resource.data.docId)).data.auditId == logId
+        // ...y "after"/"before" deben coincidir con el contenido real (sin metadatos).
+        && auditMatches(request.resource.data.after,
+             getAfter(/databases/$(database)/documents/$(request.resource.data.collection)/$(request.resource.data.docId)).data)
+        && auditMatches(request.resource.data.before,
+             get(/databases/$(database)/documents/$(request.resource.data.collection)/$(request.resource.data.docId)).data);
+      allow update, delete: if false;
+    }
+
+  }
+}

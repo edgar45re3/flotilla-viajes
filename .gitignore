@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.netlify/
+.firebase/
+.firebaserc
+*-debug.log
+firestore-debug.log
+ui-debug.log
+# Variables de entorno: nunca se suben al repositorio
+.env
+.env.*
+!.env.example
+!.env.scripts.example
+# Llave de cuenta de servicio de Firebase (SECRETA)
+service-account*.json
+*-firebase-adminsdk-*.json
+*.log
