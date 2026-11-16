@@ -31,25 +31,41 @@ export default function ChangePassword({ forced, onDone, onCancel }) {
     if (next === current) { setError('La contraseña nueva debe ser distinta a la actual.'); return; }
 
     setBusy(true);
+    const user = auth.currentUser;
     try {
-      const user = auth.currentUser;
       // Firebase exige confirmar la contraseña actual antes de cambiarla.
       await reauthenticateWithCredential(user, EmailAuthProvider.credential(user.email, authPassword(current)));
       await updatePassword(user, authPassword(next));
-      if (forced) {
+    } catch (err) {
+      console.error('Cambio de contraseña falló', err);
+      setError(MESSAGES[err.code] ?? `No se pudo cambiar la contraseña (${err.code ?? 'error desconocido'}).`);
+      setBusy(false);
+      return;
+    }
+
+    // La contraseña ya cambió en Auth. Desde aquí la temporal ya no sirve.
+    if (forced) {
+      try {
         await updateDoc(doc(db, 'users', user.uid), {
           mustChangePassword: false,
           passwordChangedAt: serverTimestamp(),
         });
+      } catch (err) {
+        console.error('No se pudo quitar mustChangePassword', err);
+        setError(
+          'Tu contraseña nueva YA quedó guardada (la temporal ya no sirve), pero el servidor no aceptó '
+          + `terminar el registro (${err.code ?? 'error'}). Avisa al administrador: debe publicar las reglas `
+          + '(npm run deploy:rules) y después tú entras con tu contraseña nueva.',
+        );
+        setBusy(false);
+        return;
       }
-      setOk(true);
-      setCurrent(''); setNext(''); setRepeat('');
-      setTimeout(() => onDone?.(), forced ? 0 : 1500);
-    } catch (err) {
-      setError(MESSAGES[err.code] ?? 'No se pudo cambiar la contraseña.');
-    } finally {
-      setBusy(false);
     }
+
+    setOk(true);
+    setCurrent(''); setNext(''); setRepeat('');
+    setBusy(false);
+    setTimeout(() => onDone?.(), forced ? 0 : 1500);
   };
 
   return (
